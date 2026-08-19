@@ -1,0 +1,17 @@
+# macOS
+.DS_Store
+
+# Python
+__pycache__/
+*.pyc
+.venv/
+
+# Jupyter
+.ipynb_checkpoints/
+
+# Competition data — never commit. Kaggle's rules prohibit redistributing it,
+# and the local fixture is regenerable via build/make_fixture.py
+data/*.csv
+
+# Generated at run time
+submission.csv
