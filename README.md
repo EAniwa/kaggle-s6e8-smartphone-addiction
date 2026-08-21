@@ -46,11 +46,21 @@ python build/build_notebook.py notebook/s6e8_walkthrough.ipynb
 
 ## What it covers
 
-21 sections building a strictly-measured scoreboard, from a constant baseline through logistic
-regression to LightGBM and blending. Every code cell is followed by a markdown cell explaining
-what happened and why.
+26 sections building a strictly-measured scoreboard, from a constant baseline through six model
+families to a stacked ensemble. Every code cell is followed by a markdown cell explaining what
+happened and why.
+
+**Models covered:** constant baseline → logistic regression → LightGBM → XGBoost → CatBoost →
+neural network (MLP) → logistic-regression stack.
 
 The sections that matter most for a learner:
+
+- **§17 Capacity before features** — sweeps `num_leaves` and applies the one-standard-error rule,
+  choosing the simplest setting statistically indistinguishable from the best.
+- **§22 Measuring diversity** — rank-correlates every model, showing that the three GBDTs are
+  near-duplicates while the neural net is genuinely different.
+- **§23 Averaging vs stacking** — plain and rank averaging both *lose* to the best single model;
+  only a learned meta-model wins.
 
 - **§10 Understanding ROC AUC** — derives the metric from its definition, proves it depends only
   on ranking, and shows the score you lose by submitting hard labels instead of probabilities.
@@ -60,6 +70,20 @@ The sections that matter most for a learner:
   moving by ~0.008 on luck alone.
 - **§18 Blending** — and the honest verdict when the blend fails to beat a single model.
 - **§19b What score to expect** — real leaderboard distribution, so your number means something.
+
+## Runtime
+
+On the full 691,369-row dataset, expect **30–60 minutes** on Kaggle's CPU for a full run —
+six model families × 5 folds. The `num_leaves` sweep in §17 subsamples to 150,000 rows
+automatically, since 25 refits on full data is impractical.
+
+To iterate faster while learning, sample the training frame right after loading:
+
+```python
+train = train.sample(100_000, random_state=42).reset_index(drop=True)
+```
+
+Absolute AUC will drop, but every lesson in the notebook still lands.
 
 ## Verification
 

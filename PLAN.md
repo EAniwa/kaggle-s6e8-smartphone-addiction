@@ -125,3 +125,45 @@ Three defects that reading alone would not have caught:
 3. **Blending on mis-scaled OOF vectors** — fold models with wildly different early-stopping
    points produce different output scales. Now rank-normalised *per fold*, and the fold-mean vs
    pooled-OOF gap is surfaced as an explicit diagnostic with a warning.
+
+
+---
+
+# Expansion: additional model families and stacking (2026-08-19)
+
+Added on request, implementing the three recommendations from the model-selection discussion.
+
+## New sections
+
+| § | Content | Teaching point |
+|---|---|---|
+| 17 | `num_leaves` capacity sweep | Tune capacity before evaluating features; one-standard-error rule |
+| 19 | XGBoost | Level-wise vs leaf-wise growth; `max_depth` ↔ `num_leaves` conversion |
+| 20 | CatBoost | Ordered boosting, ordered target statistics, symmetric trees |
+| 21 | Neural network (MLP) | A different function class is what earns blend weight |
+| 22 | Diversity analysis | Entry condition is two-dimensional: decorrelated **and** strong |
+| 23 | Averaging vs stacking | A learned meta-model can assign negative weights; an average cannot |
+
+## Results on the fixture (12,000 rows)
+
+| Method | fold-mean AUC | vs best single |
+|---|---|---|
+| Best single (LightGBM) | 0.90680 | — |
+| Plain average | 0.90194 | −0.00485 |
+| Rank average | 0.90472 | −0.00207 |
+| **Learned stack** | **0.90759** | **+0.00079** |
+
+This reproduces the pattern competitors reported on the real data: both averaging methods lose to
+the best single model, and only the learned combination wins.
+
+## Fixture-specific caveats handled in the text
+
+The 12,000-row fixture is too small for two of the lessons to appear naturally, so the notebook
+detects and explains both rather than asserting something the reader cannot see:
+
+- **The capacity sweep is flat** — the whole span (0.00017) sits inside fold noise (0.00570). The
+  code now reports this explicitly and applies the one-standard-error rule, choosing the simplest
+  setting rather than chasing a noisy argmax.
+- **Model correlations are understated** — LightGBM ↔ XGBoost measures 0.80 on the fixture versus
+  0.997 reported on full data, because small-sample fold models are unstable. §22 warns that this
+  is a sample-size artefact, not evidence of complementarity.
