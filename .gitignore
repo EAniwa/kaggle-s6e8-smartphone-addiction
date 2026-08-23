@@ -15,3 +15,6 @@ data/*.csv
 
 # Generated at run time
 submission.csv
+
+# Intermediate scratch used while assembling build_notebook.py
+build/chunks/
