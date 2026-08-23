@@ -2229,8 +2229,110 @@ dependable gain and teaches you nothing about your data. It is the final polish 
 never a substitute for the work in Sections 17 through 25.
 """)
 
-# ───────────────────────────── 27. Scoreboard ─────────────────────────────
-md("## 27. The scoreboard")
+# ───────────────────────────── 27. Competitive config ─────────────────────────────
+md("## 27. Putting it together — a competitive configuration")
+
+code(r"""
+# Everything measured as a real win, combined into one model:
+#   - target-encoded numerics AS INPUT FEATURES (reported ~+0.0030)
+#   - max_bin far above the default 255 (reported ~+0.0022)
+#   - capacity from the Section 17 sweep
+#   - a slower learning rate with more trees
+#   - seed averaging on top
+#
+# NOTE ON HYPERPARAMETER TUNING: deliberately not doing an Optuna search here.
+# On this competition, long HPO runs on already-good models moved scores by
+# ~0.00002. The levers below are two orders of magnitude larger.
+comp_params = {
+    **lgb_params,
+    "max_bin": 4095,          # the single most underrated parameter here
+    "learning_rate": 0.02,
+    "n_estimators": 8000,
+    "min_child_samples": 60,
+}
+COMP_SEEDS = [42, 202]
+
+print("Competitive configuration")
+print(f"  max_bin        {comp_params['max_bin']}")
+print(f"  num_leaves     {comp_params['num_leaves']}")
+print(f"  learning_rate  {comp_params['learning_rate']}")
+print(f"  seeds          {COMP_SEEDS}\n")
+
+comp_seed_oofs, comp_seed_tests = [], []
+for sd in COMP_SEEDS:
+    p = {**comp_params, "random_state": sd, "bagging_seed": sd,
+         "feature_fraction_seed": sd}
+    oof_c = np.zeros(len(y)); test_c = np.zeros(len(X_test_gbm))
+    for tr, va in cv.split(X_gbm, y):
+        prior = y[tr].mean()
+        Xtr = X_gbm.iloc[tr].copy(); Xva = X_gbm.iloc[va].copy(); Xte = X_test_gbm.copy()
+        # Target encoding, leak-safe, exactly as in Section 20 — but here the
+        # encoded columns JOIN the raw features rather than replacing a model.
+        for c in TE_COLS:
+            e_tr, e_va = target_encode(key_tr[c].iloc[tr], y[tr], key_tr[c].iloc[va], prior)
+            _,    e_te = target_encode(key_tr[c].iloc[tr], y[tr], key_te[c], prior)
+            Xtr[f"te__{c}"], Xva[f"te__{c}"], Xte[f"te__{c}"] = e_tr, e_va, e_te
+
+        m = lgb.LGBMClassifier(**p)
+        m.fit(Xtr, y[tr], eval_set=[(Xva, y[va])], eval_metric="auc",
+              callbacks=[lgb.early_stopping(300, verbose=False)])
+        oof_c[va] = m.predict_proba(Xva)[:, 1]
+        test_c += m.predict_proba(Xte)[:, 1] / N_SPLITS
+    sc, _ = fold_auc_mean(oof_c, y, cv, X_gbm)
+    print(f"  seed {sd:<6} fold-mean AUC {sc:.5f}")
+    comp_seed_oofs.append(rank_by_fold(oof_c, cv, X, y))
+    comp_seed_tests.append(rankdata(test_c) / len(test_c))
+
+oof_comp = np.mean(comp_seed_oofs, axis=0)
+test_comp = np.mean(comp_seed_tests, axis=0)
+comp_mean, comp_std = fold_auc_mean(oof_comp, y, cv, X_gbm)
+
+print(f"  {'-' * 42}")
+print(f"  COMPETITIVE fold-mean AUC {comp_mean:.5f}  (+/- {comp_std:.5f})")
+print(f"  vs plain LightGBM         {comp_mean - lgb_mean:+.5f}")
+print(f"\n  Estimated public LB (CV + 0.0012): {comp_mean + 0.0012:.5f}")
+
+display(record("Competitive config", comp_mean, comp_std,
+               "TE features + max_bin 4095 + seed avg"))
+""")
+
+md(r"""
+**What this cell does and why it matters**
+
+This combines every lever that has been *measured* as a real win on this competition into a
+single model. It is the configuration to actually submit.
+
+**Why `max_bin` matters so much here, and why it is usually ignored.** LightGBM does not consider
+every possible split point — that would be far too slow. It buckets each feature into at most
+`max_bin` bins (default **255**) and only considers boundaries between buckets. That is a lossy
+compression of your features, and it is invisible.
+
+On synthetic data this is exactly the wrong default. The generator placed values on a fine
+discrete grid, and the signal lives in *precisely where* a value falls on it. Bucketing 1,300
+distinct screen-time values into 255 bins destroys most of that resolution before the model sees
+it. Raising `max_bin` to 4095 hands the grid back. Reported worth **~+0.0022** here — more than
+most people's entire feature engineering effort, from one integer.
+
+**Why target-encoded columns join the raw features rather than replacing them.** Section 20 kept
+target encoding as a separate model to demonstrate the technique cleanly. That is good pedagogy
+and a weaker model. The encoded columns tell the tree "people at exactly this value were addicted
+at this rate", while the raw columns preserve ordering and let it split on ranges. **The two
+representations are complementary**, and the reported ~+0.0030 comes from having both.
+
+**Why there is no Optuna search here.** It would look more sophisticated and buy almost nothing.
+On the most recent comparable Playground episode, extended hyperparameter searches on
+already-good models moved scores by **0.00002**. Every lever above is two orders of magnitude
+larger. **Spend effort where the derivative is, not where the ritual is.**
+
+**Expect this to fall short of 0.97 on its own, and that is the honest position.** A single
+strong GBDT lands around 0.966–0.969 on this competition. Crossing 0.970 reliably needs *breadth*
+in the stack — the published notebooks that reach 0.97113 combine **79–132 base models**, many
+pooled from a community OOF library built on the shared 5-fold seed-42 convention. That is a
+different kind of work than improving one model, and Section 30 says so plainly.
+""")
+
+# ───────────────────────────── 28. Scoreboard ─────────────────────────────
+md("## 28. The scoreboard")
 
 code(r"""
 board = pd.DataFrame(scoreboard)
@@ -2286,7 +2388,7 @@ difference — and that is worth investigating rather than ignoring.
 """)
 
 md(r"""
-## 27b. What score should you actually expect?
+## 28b. What score should you actually expect?
 
 A number without context is not information, so here is the real competitive landscape as of
 mid-August 2026, taken from the public leaderboard of 2,273 teams:
@@ -2327,8 +2429,8 @@ test. So your CV is trustworthy here. **Select your final submission by CV, not 
 """)
 
 
-# ───────────────────────────── 28. Submission ─────────────────────────────
-md("## 28. Creating the submission file")
+# ───────────────────────────── 29. Submission ─────────────────────────────
+md("## 29. Creating the submission file")
 
 code(r"""
 candidates = {
@@ -2339,6 +2441,7 @@ candidates = {
     "neural_net": (nn_mean, test_nn),
     "lightgbm_te": (te_mean, test_te),
     "lgbm_seed_avg": (sa_mean, test_seedavg),
+    "competitive": (comp_mean, test_comp),
     "stack": (stack_mean, test_stack),
 }
 best_name = max(candidates, key=lambda k: candidates[k][0])
@@ -2413,9 +2516,9 @@ works end to end, and improve from there.
 """)
 
 
-# ───────────────────────────── 29. Next steps ─────────────────────────────
+# ───────────────────────────── 30. Next steps ─────────────────────────────
 md(r"""
-## 29. Where to go next
+## 30. Where to go next
 
 The pipeline above is complete and honest, but it is deliberately a *foundation* rather than a
 maximally-tuned solution. Here is what to try next, **ordered by expected return on effort**.

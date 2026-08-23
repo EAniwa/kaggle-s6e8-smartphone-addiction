@@ -46,7 +46,7 @@ python build/build_notebook.py notebook/s6e8_walkthrough.ipynb
 
 ## What it covers
 
-29 sections building a strictly-measured scoreboard, from a constant baseline through six model
+30 sections building a strictly-measured scoreboard, from a constant baseline through six model
 families to a stacked ensemble. Every code cell is followed by a markdown cell explaining what
 happened and why.
 
@@ -67,6 +67,8 @@ The sections that matter most for a learner:
 - **§25 Averaging vs stacking** — plain and rank averaging both *lose* to the best single model;
   only a learned meta-model wins.
 - **§26 Seed averaging** — measures how much of a leaderboard position is luck.
+- **§27 Competitive configuration** — every measured lever combined: target-encoded features
+  alongside raw ones, `max_bin` 4095, swept capacity, seed averaging. This is the one to submit.
 
 - **§10 Understanding ROC AUC** — derives the metric from its definition, proves it depends only
   on ranking, and shows the score you lose by submitting hard labels instead of probabilities.
@@ -100,6 +102,26 @@ cells run clean and all 7 submission sanity checks pass.
 Note the fixture is 12,000 rows against the real 691,369, so **the AUC values you see on real
 data will differ** — expect roughly 0.96 rather than the ~0.90 the fixture produces. The fixture
 exists to prove the code runs, not to predict the score.
+
+## Chasing a specific score
+
+Public LB runs **≈ CV + 0.0010–0.0015**. Reference points on the real data:
+
+| Target | What it takes |
+|---|---|
+| ~0.9655 (median) | Any competent GBDT |
+| ~0.966 | Tuned single XGBoost with basic feature engineering |
+| **~0.969** | §27 competitive config: target encoding + `max_bin` + capacity + seeds |
+| **>0.970** (top ~450) | Requires stacking *breadth* — see below |
+| 0.97113 (top ~50) | Public notebooks pooling 79–132 base models |
+
+The estimated Bayes ceiling is **~0.9701 OOF**, so 0.97 on *CV* is essentially the theoretical
+limit; 0.97 on the *leaderboard* corresponds to CV ≈ 0.9685.
+
+Crossing 0.970 is not a modelling problem, it is a **breadth** problem. Published notebooks reach
+it by combining 79–132 base models, many pooled from a community OOF library published on the
+shared `StratifiedKFold(5, shuffle=True, random_state=42)` convention. Hyperparameter tuning is
+not the lever — extended searches on already-good models moved scores by ~0.00002.
 
 ## Notes on this competition specifically
 
