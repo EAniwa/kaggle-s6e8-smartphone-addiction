@@ -1162,7 +1162,7 @@ This is exactly what early stopping can cause: if one fold stops at 300 trees an
 those two models are not comparable in output scale.
 
 **Fold-mean is the more robust summary**, which is why it is our canonical metric, and why we
-rank-normalise *per fold* before combining in Section 23. If you see a large gap, do not panic —
+rank-normalise *per fold* before combining in Section 25. If you see a large gap, do not panic —
 but do check whether your early stopping is behaving erratically across folds.
 """)
 
@@ -1411,7 +1411,7 @@ capacity does not matter.**
 
 **A caveat on what we just did.** We selected `num_leaves` using cross-validated scores and will
 now report cross-validated scores using it. That is mild selection bias — the same effect flagged
-for the blend weight in Section 23. With five candidates on one axis it is small. Sweep fifty
+for the blend weight in Section 25. With five candidates on one axis it is small. Sweep fifty
 hyperparameters this way and your CV becomes meaningfully optimistic; that is when you need a
 separate inner split (nested CV).
 """)
@@ -1485,8 +1485,240 @@ implements it, and it is worth running on your final model.
 predictions and a faster pipeline. Do verify this with a CV run rather than assuming it.
 """)
 
-# ───────────────────────────── 19. XGBoost ─────────────────────────────
-md("## 19. Model 4 — XGBoost")
+
+# ───────────────────────────── 19. Generator artifacts ─────────────────────────────
+md("## 19. Feature engineering — mining the generator's fingerprints")
+
+code(r"""
+# Columns that represent hours. Guarded so the notebook still runs if the
+# schema ever changes.
+TIME_COLS = [c for c in ["daily_screen_time_hours", "social_media_hours",
+                         "gaming_hours", "work_study_hours", "sleep_hours",
+                         "weekend_screen_time"] if c in X.columns]
+
+def add_artifact_features(df):
+    out = df.copy()
+
+    # (a) FIRST DECIMAL DIGIT. Synthetic generators leave rounding fingerprints;
+    # the digit itself has no real-world meaning but can track the grid the
+    # data was produced on.
+    for c in TIME_COLS:
+        d = (np.round(out[c] * 10) % 10)
+        out[f"{c}__digit1"] = pd.Categorical(d.fillna(-1).astype(int),
+                                             categories=list(range(-1, 10)))
+
+    # (b) RESIDUAL SCREEN TIME. Time not accounted for by the named activities.
+    # Where the generator's internal arithmetic does not balance, this is where
+    # it shows up.
+    parts = [c for c in ["social_media_hours", "gaming_hours", "work_study_hours"]
+             if c in out.columns]
+    if "daily_screen_time_hours" in out.columns and parts:
+        out["other_screen"] = out["daily_screen_time_hours"] - out[parts].sum(axis=1)
+
+    # (c) WEEKEND / WEEKDAY RATIO. In the source survey this ratio was bounded;
+    # rows outside those bounds are physically implausible.
+    if {"weekend_screen_time", "daily_screen_time_hours"} <= set(out.columns):
+        out["weekend_ratio"] = (out["weekend_screen_time"]
+                                / out["daily_screen_time_hours"].replace(0, np.nan))
+    return out
+
+X_fe = add_artifact_features(X_gbm)
+X_test_fe = add_artifact_features(X_test_gbm)
+new_feats = [c for c in X_fe.columns if c not in X_gbm.columns]
+print(f"Added {len(new_feats)} features: {new_feats}\n")
+
+# ---- Ablation: does the enriched feature set actually beat the baseline? ----
+def run_lgb(Xtr_all, Xte_all, tag):
+    oof = np.zeros(len(y)); te = np.zeros(len(Xte_all))
+    for tr, va in cv.split(Xtr_all, y):
+        m = lgb.LGBMClassifier(**lgb_params)
+        m.fit(Xtr_all.iloc[tr], y[tr],
+              eval_set=[(Xtr_all.iloc[va], y[va])], eval_metric="auc",
+              callbacks=[lgb.early_stopping(200, verbose=False)])
+        oof[va] = m.predict_proba(Xtr_all.iloc[va])[:, 1]
+        te += m.predict_proba(Xte_all)[:, 1] / N_SPLITS
+    mean_, std_ = fold_auc_mean(oof, y, cv, Xtr_all)
+    print(f"  {tag:<28} {mean_:.5f}  (+/- {std_:.5f})")
+    return oof, te, mean_, std_
+
+print("Ablation")
+print("-" * 56)
+_, _, base_m, base_s = run_lgb(X_gbm, X_test_gbm, "baseline features")
+oof_fe, test_fe, fe_m, fe_s = run_lgb(X_fe, X_test_fe, "+ generator artifacts")
+
+fe_gain = fe_m - base_m
+print("-" * 56)
+print(f"  gain {fe_gain:+.5f}   fold noise +/- {base_s:.5f}")
+
+if fe_gain > base_s:
+    X_gbm, X_test_gbm = X_fe, X_test_fe
+    print("\n  ADOPTED: the gain exceeds fold noise.")
+else:
+    print("\n  REJECTED: the gain is inside fold noise — keeping baseline features.")
+    print("  (A negative result is a result. We do not ship what we cannot measure.)")
+print(f"  Feature set for the rest of the notebook: {X_gbm.shape[1]} columns")
+""")
+
+md(r"""
+**What this cell does and why it matters**
+
+This is feature engineering aimed at a very specific target: **the data is synthetic, so it
+carries fingerprints of the program that made it.**
+
+**Why the first decimal digit could possibly matter.** In the real world it is meaningless — a
+person with 7.6 screen-time hours is not fundamentally different from one with 7.7. But a
+generator draws from distributions, rounds, and sometimes composes values arithmetically, and
+those operations leave uneven residue on the final decimal place. If the addicted rate varies
+measurably across digits, that is not a fact about smartphones. It is a fact about the code that
+produced the file — and on a synthetic competition, that still scores.
+
+**Residual screen time** applies the same idea to arithmetic consistency. If the generator drew
+total screen time independently from its components, the two will not always reconcile, and the
+size of the mismatch tracks how the row was produced.
+
+**Two properties make these features safe to compute outside the CV loop**, and it is worth being
+explicit since Section 13 was so emphatic about the opposite case:
+
+1. They are **row-wise** — each output depends only on that row's own values.
+2. They **never touch the target**.
+
+That is the test. A transformation that uses only a row's own features leaks nothing. A
+transformation that uses the target — like the encoding in Section 20 — must go inside the folds.
+Learn to classify transformations this way and leakage stops being mysterious.
+
+**The ablation is the real content of this section.** Notice we do not add the features and
+assume they helped. We measure both feature sets on identical folds and compare the gain against
+`base_s`, the fold noise — and we **reject** the change if the gain does not clear it.
+
+This matters because published results on this competition show ordinary behavioural feature
+engineering — ratios, sums, differences — landing between neutral and *negative*, while capacity
+tuning was worth eighteen times more. **Feature engineering is not automatically good.** It adds
+columns, which adds ways to overfit, and it must earn its place like anything else.
+""")
+
+# ───────────────────────────── 20. Target encoding ─────────────────────────────
+md("## 20. Target encoding — the powerful, dangerous one")
+
+code(r"""
+def _smooth_means(keys, yy, prior, m):
+    # Smoothed group means: a group with few rows is pulled toward the global
+    # rate. m is the strength of that pull, measured in "virtual rows".
+    g = pd.DataFrame({"k": np.asarray(keys), "y": yy}).groupby("k")["y"].agg(["sum", "count"])
+    return (g["sum"] + m * prior) / (g["count"] + m)
+
+
+def target_encode(col_tr, y_tr, col_va, prior, m=20, inner_splits=5):
+    # Validation rows: encode with statistics from the WHOLE training fold.
+    # Training rows: encode with INNER out-of-fold statistics, so no row ever
+    # sees its own label. Skipping this inner step is the classic mistake.
+    enc_tr = np.full(len(col_tr), prior, dtype=float)
+    inner = StratifiedKFold(inner_splits, shuffle=True, random_state=SEED)
+    for i_tr, i_va in inner.split(np.zeros(len(col_tr)), y_tr):
+        mp = _smooth_means(col_tr.iloc[i_tr], y_tr[i_tr], prior, m)
+        enc_tr[i_va] = col_tr.iloc[i_va].map(mp).fillna(prior).to_numpy()
+    mp_full = _smooth_means(col_tr, y_tr, prior, m)
+    return enc_tr, col_va.map(mp_full).fillna(prior).to_numpy()
+
+
+# Treat every numeric column as CATEGORICAL by stringifying it. On a synthetic
+# grid this lets the model memorise the generator's lookup table.
+TE_COLS = numeric_cols
+key_tr = X[TE_COLS].round(2).astype(str)
+key_te = X_test[TE_COLS].round(2).astype(str)
+print(f"Target-encoding {len(TE_COLS)} numeric columns as categories\n")
+print(f"{'column':<28} {'distinct':>9} {'rows/category':>14}")
+print("-" * 53)
+for c in TE_COLS:
+    nu = int(key_tr[c].nunique())
+    print(f"{c:<28} {nu:>9,} {len(key_tr)/nu:>14.1f}")
+print("\nRows per category is the number that decides whether this is safe:")
+print("  many rows per category  -> stable estimates, encoding works")
+print("  few rows per category   -> mostly noise, leaning hard on smoothing\n")
+
+oof_te = np.zeros(len(y))
+test_te = np.zeros(len(X_test))
+
+for fold, (tr, va) in enumerate(cv.split(X_gbm, y)):
+    prior = y[tr].mean()
+    Xtr = X_gbm.iloc[tr].copy(); Xva = X_gbm.iloc[va].copy(); Xte = X_test_gbm.copy()
+
+    for c in TE_COLS:
+        e_tr, e_va = target_encode(key_tr[c].iloc[tr], y[tr], key_tr[c].iloc[va], prior)
+        _,    e_te = target_encode(key_tr[c].iloc[tr], y[tr], key_te[c], prior)
+        Xtr[f"te__{c}"], Xva[f"te__{c}"], Xte[f"te__{c}"] = e_tr, e_va, e_te
+
+    m = lgb.LGBMClassifier(**lgb_params)
+    m.fit(Xtr, y[tr], eval_set=[(Xva, y[va])], eval_metric="auc",
+          callbacks=[lgb.early_stopping(200, verbose=False)])
+    oof_te[va] = m.predict_proba(Xva)[:, 1]
+    test_te += m.predict_proba(Xte)[:, 1] / N_SPLITS
+    print(f"  fold {fold}  AUC {roc_auc_score(y[va], oof_te[va]):.5f}")
+
+te_mean, te_std = fold_auc_mean(oof_te, y, cv, X_gbm)
+print(f"  {'-' * 42}")
+print(f"  fold-mean AUC  {te_mean:.5f}  (+/- {te_std:.5f})")
+print(f"  vs plain LightGBM: {te_mean - lgb_mean:+.5f}")
+
+display(record("LightGBM + target encoding", te_mean, te_std,
+               "numerics as categories, inner-OOF encoded"))
+""")
+
+md(r"""
+**What this cell does and why it matters**
+
+**Target encoding replaces a category with the average target value for that category.** It is
+one of the most powerful techniques for tabular data and by far the easiest way to destroy your
+validation score without noticing.
+
+**Why stringify continuous columns?** It looks perverse — throwing away the ordering of a real
+number. But this data is synthetic and sits on a **discrete grid**: the generator produced a
+finite set of distinct values. Treating each value as its own category lets the model look up
+"what fraction of people with exactly this screen time were addicted", effectively memorising the
+generator's own table. On real-world continuous data this would overfit disastrously. Here it is
+reported as the single most valuable transformation on the competition, worth about +0.003.
+
+**The smoothing parameter `m` is doing important work.** From Section 8: a category with 3 rows
+and a 100% positive rate is noise, not signal. The formula
+
+`(sum + m × prior) / (count + m)`
+
+pulls every group toward the global rate, and `m` sets how hard. A group with 3 rows and `m=20`
+sits mostly at the prior; a group with 5,000 rows barely moves. **This is what makes the
+technique usable at all** — without it, rare categories inject pure noise straight into your
+features.
+
+**The inner out-of-fold loop is the part that everyone gets wrong.** Consider encoding naively:
+compute each category's mean target from the training fold, then assign it to those same training
+rows. Every row's feature now contains a contribution from **its own label**. The model discovers
+this instantly, leans on it entirely, and reports a spectacular validation score that evaporates
+on the test set.
+
+The fix is the structure above:
+
+- **Validation and test rows** — encode using the full training fold. Safe, because those rows'
+  labels were never in the statistics.
+- **Training rows** — encode using an *inner* K-fold split, so each training row's value comes
+  only from *other* training rows.
+
+This is Section 13's leakage lesson applied at the feature level, and it is the reason target
+encoding has such a bad reputation among people who have been burned by it. **The technique is
+not dangerous. Implementing it without the inner loop is.**
+
+**Watch the rows-per-category diagnostic.** If a column has nearly as many distinct values as
+rows, every "category" holds one or two people and its target mean is almost pure noise. Smoothing
+then pulls essentially everything back to the prior and the feature carries little. The technique
+works best when the generator's grid is *coarse relative to your row count* — so it will look far
+better on the full 691,369 rows than on a small subsample, where the same grid spreads thin.
+**If you see single-digit rows per category, be sceptical of any gain this reports.**
+
+**A note on what this model becomes.** Rather than merging these features into the main matrix,
+we keep this as its own model. It uses a different *representation* of the same data — which,
+per Section 24, is exactly the kind of diversity that earns weight in a stack. It joins the
+ensemble as a base model in its own right.
+""")
+
+# ───────────────────────────── 21. XGBoost ─────────────────────────────
+md("## 21. Model 4 — XGBoost")
 
 code(r"""
 import xgboost as xgb
@@ -1560,11 +1792,12 @@ your two scores here differ by more than about `2 × cv_std`, that is worth inve
 probably means one of them is misconfigured rather than genuinely better.
 
 The interesting question is not which of these wins. It is whether having both helps at all —
-Section 22 answers that, and the answer is instructive.
+Section 24 answers that, and the answer is instructive.
 """)
 
-# ───────────────────────────── 20. CatBoost ─────────────────────────────
-md("## 20. Model 5 — CatBoost")
+
+# ───────────────────────────── 22. CatBoost ─────────────────────────────
+md("## 22. Model 5 — CatBoost")
 
 code(r"""
 from catboost import CatBoostClassifier, Pool
@@ -1644,8 +1877,9 @@ three. Being *different* has value that a raw score comparison does not show. Se
 measures exactly that.
 """)
 
-# ───────────────────────────── 21. Neural network ─────────────────────────────
-md("## 21. Model 6 — a neural network")
+
+# ───────────────────────────── 23. Neural network ─────────────────────────────
+md("## 23. Model 6 — a neural network")
 
 code(r"""
 from sklearn.neural_network import MLPClassifier
@@ -1703,7 +1937,7 @@ categorical dtypes.
 
 **Expect a lower score than the GBDTs, and do not read that as failure.** On tabular data of
 this size an MLP typically lands somewhat behind well-tuned boosting. It earns its place through
-decorrelation, not through raw accuracy. Section 22 shows the difference between those two forms
+decorrelation, not through raw accuracy. Section 24 shows the difference between those two forms
 of value.
 
 **If you want to push this further**, `MLPClassifier` is a deliberately simple choice — it keeps
@@ -1713,8 +1947,9 @@ are **RealMLP** and **TabM**, and in the most recent comparable Playground episo
 (learned dense vectors per category, instead of one-hot) are the other standard upgrade.
 """)
 
-# ───────────────────────────── 22. Diversity ─────────────────────────────
-md("## 22. Measuring diversity — which models actually differ?")
+
+# ───────────────────────────── 24. Diversity ─────────────────────────────
+md("## 24. Measuring diversity — which models actually differ?")
 
 code(r"""
 from scipy.stats import rankdata
@@ -1725,6 +1960,7 @@ oof_matrix = pd.DataFrame({
     "xgboost": oof_xgb,
     "catboost": oof_cb,
     "neural_net": oof_nn,
+    "lgbm_te": oof_te,
 })
 test_matrix = pd.DataFrame({
     "logreg": test_lr,
@@ -1732,6 +1968,7 @@ test_matrix = pd.DataFrame({
     "xgboost": test_xgb,
     "catboost": test_cb,
     "neural_net": test_nn,
+    "lgbm_te": test_te,
 })
 
 solo = pd.Series({c: fold_auc_mean(oof_matrix[c].values, y, cv, X)[0]
@@ -1797,7 +2034,7 @@ estimated from data, and with few rows the fold models are unstable, so everythi
 that is a sample-size artefact, not a discovery that they are complementary. **Trust this
 analysis in proportion to how much data it was computed on.**
 
-**Why correlate ranks rather than raw probabilities?** Same reasoning as Section 23. Our metric
+**Why correlate ranks rather than raw probabilities?** Same reasoning as Section 25. Our metric
 depends only on ordering, so two models that produce identical rankings on different scales are
 identical *for our purposes*. Correlating raw probabilities would report them as different when
 they are not.
@@ -1807,8 +2044,9 @@ they are not.
 looks. Adding a genuinely new *family* beats adding another variant, every time.
 """)
 
-# ───────────────────────────── 23. Combining ─────────────────────────────
-md("## 23. Combining models — averaging vs stacking")
+
+# ───────────────────────────── 25. Combining ─────────────────────────────
+md("## 25. Combining models — averaging vs stacking")
 
 code(r"""
 # Rank-normalise WITHIN each fold, so every model is on the same scale
@@ -1909,12 +2147,90 @@ disappoints.
 
 **Read the weights as diagnosis, not just machinery.** They tell you what each model is
 contributing. A near-zero weight means that model is redundant and you can drop it — faster
-pipeline, same score. That is Section 22's correlation analysis confirmed from the other
+pipeline, same score. That is Section 24's correlation analysis confirmed from the other
 direction, and it is how you decide what to prune.
 """)
 
-# ───────────────────────────── 24. Scoreboard ─────────────────────────────
-md("## 24. The scoreboard")
+
+# ───────────────────────────── 26. Seed averaging ─────────────────────────────
+md("## 26. Seed averaging — the cheapest reliable gain")
+
+code(r"""
+SEEDS = [42, 202, 1337]
+
+seed_oofs, seed_tests, seed_scores = [], [], []
+
+print(f"Running LightGBM with {len(SEEDS)} different random seeds")
+print("-" * 46)
+for sd in SEEDS:
+    p = {**lgb_params, "random_state": sd, "bagging_seed": sd, "feature_fraction_seed": sd}
+    oof_s = np.zeros(len(y)); test_s = np.zeros(len(X_test_gbm))
+    for tr, va in cv.split(X_gbm, y):
+        m = lgb.LGBMClassifier(**p)
+        m.fit(X_gbm.iloc[tr], y[tr],
+              eval_set=[(X_gbm.iloc[va], y[va])], eval_metric="auc",
+              callbacks=[lgb.early_stopping(200, verbose=False)])
+        oof_s[va] = m.predict_proba(X_gbm.iloc[va])[:, 1]
+        test_s += m.predict_proba(X_test_gbm)[:, 1] / N_SPLITS
+    sc, _ = fold_auc_mean(oof_s, y, cv, X_gbm)
+    seed_oofs.append(rank_by_fold(oof_s, cv, X, y))
+    seed_tests.append(rankdata(test_s) / len(test_s))
+    seed_scores.append(sc)
+    print(f"  seed {sd:<6} fold-mean AUC {sc:.5f}")
+
+oof_seedavg = np.mean(seed_oofs, axis=0)
+test_seedavg = np.mean(seed_tests, axis=0)
+sa_mean, sa_std = fold_auc_mean(oof_seedavg, y, cv, X_gbm)
+
+print("-" * 46)
+print(f"  mean of individual seeds   {np.mean(seed_scores):.5f}")
+print(f"  spread across seeds        {np.ptp(seed_scores):.5f}")
+print(f"  RANK-AVERAGED across seeds {sa_mean:.5f}")
+print(f"  gain vs the average seed   {sa_mean - np.mean(seed_scores):+.5f}")
+print(f"  gain vs the BEST seed      {sa_mean - max(seed_scores):+.5f}")
+
+display(record(f"LightGBM x{len(SEEDS)} seeds", sa_mean, sa_std,
+               "rank-averaged across seeds"))
+""")
+
+md(r"""
+**What this cell does and why it matters**
+
+**Seed averaging does not make your model better. It makes your model less random.** That
+distinction is the whole point, and it is why this technique is both reliable and modest.
+
+**Where the randomness comes from.** A LightGBM fit is not deterministic given the data. The seed
+controls which rows each tree sees (`bagging_fraction`), which features it may split on
+(`feature_fraction`), and tie-breaking during tree construction. Change the seed and you get a
+genuinely different model — same data, same hyperparameters, different fitted result.
+
+The `spread across seeds` figure above measures that directly. **This is a lower bound on how
+much of your leaderboard position is luck**, and it is usually larger than people expect. On this
+competition, a paired analysis found that two seeds of the same model swap places roughly half
+the time, and that ±1 seed of noise spans about sixty leaderboard ranks between positions 10 and
+100.
+
+**Why averaging helps.** Each model's prediction is roughly *signal + noise*. The signal is shared
+across seeds; the noise is not. Average N models and the noise partially cancels while the signal
+survives. Standard error falls with roughly √N, which is why the gain is real but shrinking —
+going from 1 to 3 seeds helps meaningfully, 3 to 10 much less.
+
+**Compare against the *average* seed, not the best one.** This is the subtle trap. The best of
+three seeds was chosen *after* seeing the scores, so it is optimistically biased — you cannot
+know in advance which seed will win. The honest comparison is against what you would have got by
+picking a seed blindly, which is the mean. If your gain looks negative against the best seed but
+positive against the mean, seed averaging is still doing its job.
+
+**Why rank-average rather than mean the probabilities?** Same reasoning as Section 23 — different
+fits produce different output scales, and our metric only cares about order.
+
+**When to use it.** Last, once modelling is finished. It costs N× the compute for a small,
+dependable gain and teaches you nothing about your data. It is the final polish before submission,
+never a substitute for the work in Sections 17 through 25.
+""")
+
+# ───────────────────────────── 27. Scoreboard ─────────────────────────────
+md("## 27. The scoreboard")
 
 code(r"""
 board = pd.DataFrame(scoreboard)
@@ -1970,7 +2286,7 @@ difference — and that is worth investigating rather than ignoring.
 """)
 
 md(r"""
-## 24b. What score should you actually expect?
+## 27b. What score should you actually expect?
 
 A number without context is not information, so here is the real competitive landscape as of
 mid-August 2026, taken from the public leaderboard of 2,273 teams:
@@ -2010,8 +2326,9 @@ adversarial validation on this data finds no meaningful distribution drift betwe
 test. So your CV is trustworthy here. **Select your final submission by CV, not by public rank.**
 """)
 
-# ───────────────────────────── 25. Submission ─────────────────────────────
-md("## 25. Creating the submission file")
+
+# ───────────────────────────── 28. Submission ─────────────────────────────
+md("## 28. Creating the submission file")
 
 code(r"""
 candidates = {
@@ -2020,6 +2337,8 @@ candidates = {
     "xgboost": (xgb_mean, test_xgb),
     "catboost": (cb_mean, test_cb),
     "neural_net": (nn_mean, test_nn),
+    "lightgbm_te": (te_mean, test_te),
+    "lgbm_seed_avg": (sa_mean, test_seedavg),
     "stack": (stack_mean, test_stack),
 }
 best_name = max(candidates, key=lambda k: candidates[k][0])
@@ -2093,63 +2412,55 @@ upload the file on the competition's Submit Predictions page. **The deadline is 
 works end to end, and improve from there.
 """)
 
-# ───────────────────────────── 26. Next steps ─────────────────────────────
+
+# ───────────────────────────── 29. Next steps ─────────────────────────────
 md(r"""
-## 26. Where to go next
+## 29. Where to go next
 
 The pipeline above is complete and honest, but it is deliberately a *foundation* rather than a
 maximally-tuned solution. Here is what to try next, **ordered by expected return on effort**.
 
-### 1. Increase model capacity before engineering features
+Sections 17 through 26 already implement the highest-value items: capacity tuning, generator-artifact
+features, target encoding, three extra model families, stacking, and seed averaging. **Two of those
+were measured and rejected** — which is itself the most useful thing this notebook can show you.
 
-The most counter-intuitive finding from this competition: competitors measured 15 engineered
-features as worth **+0.00042** at `num_leaves=15`, while simply changing `num_leaves` from 15 to
-31 was worth **+0.00773** — eighteen times more. Re-running the same feature ablation at the
-correct capacity turned the features **negative**. The feature engineering had been quietly
-papering over an underfitting model.
+Here is what remains genuinely untried, in order of expected return.
 
-**The lesson generalises: tune capacity first, then evaluate features.** Otherwise you cannot
-tell whether a feature helped or merely compensated for a model that was too small. Also try
-raising LightGBM's `max_bin` well above its default, reported here as worth about +0.002.
+### 1. Grow the stacking pool
 
-### 2. Target encoding of the numeric columns
+The single biggest remaining lever on this competition. Public stacks reach the top ~50 by
+combining **80–130 base models**, and competitors publish their OOF arrays on the shared
+`StratifiedKFold(5, shuffle=True, random_state=42)` convention specifically so they can be pooled.
+Measured effect of growing a pool from 79 to 132 members: **+0.00032** — against **±0.000004** for
+tuning the meta-model's regularisation. **Adding base models beats tuning the blender**, and it is
+not close.
 
-Reported as the single most valuable feature transformation here (~+0.003): treat the continuous
-columns as categorical and replace each value with a smoothed out-of-fold mean of the target.
-This works because the synthetic data sits on a discrete grid, so the encoding effectively
-memorises the generator's lookup table. **Compute it inside each fold** — Section 13 explains
-exactly what happens if you do not.
+### 2. Better tabular neural networks
 
-### 3. Generator-artifact features
+Our `MLPClassifier` is deliberately simple. **RealMLP** and **TabM** are the competitive options,
+and in the most recent comparable Playground episode they *beat* CatBoost and XGBoost on CV,
+public and private score. Since the neural net is already the most decorrelated member of our
+ensemble, making it stronger raises its stack weight directly — the two-dimensional entry
+condition from Section 24 with both dimensions improved at once.
 
-The synthetic data carries fingerprints of how it was produced. Two that competitors measured as
-genuinely positive: the **first decimal digit** of each time column (the addicted rate varies
-measurably across digits), and **residual screen time** (`daily_screen_time` minus the sum of
-its component activities), which exposes rows where the generator's internal arithmetic does not
-balance.
+### 3. Optuna hyperparameter search
 
-Note that ordinary behavioural feature engineering — ratios, sums, differences — is reported as
-roughly **neutral to negative** here. This is not a general truth about tabular ML; it is a fact
-about *this* dataset. Measure it on yours.
+Replace the single-axis `num_leaves` sweep with a proper multi-dimensional search over
+`num_leaves`, `min_child_samples`, `learning_rate`, `feature_fraction`, `reg_lambda`, and
+especially **`max_bin`** — raising `max_bin` well above its default is reported as worth about
+**+0.002** here. Use a subsample for the search, then confirm on full data.
 
-### 4. Add different model *families* to the blend
+### 4. Nested cross-validation for the stack
 
-Diversity is what pays, and diversity means a different *kind* of model, not another variant.
-Measured correlations here: LightGBM to XGBoost **0.997** (blend weight ≈ 0), GBDT to a neural
-network with embeddings **0.974** (blend weight **0.22**). **CatBoost**, **XGBoost**, and
-especially a **neural net** are worth adding; a second tuned LightGBM is not.
+Section 25 flagged a residual optimism: the meta-model's training rows carry OOF predictions from
+base models that saw some validation rows. Nested CV removes it. Expensive, and mainly worth doing
+when you need to trust the absolute number rather than the ranking.
 
-### 5. Stacking rather than weighted averaging
+### 5. Adversarial validation
 
-Replace the hand-scanned blend weight with a logistic regression trained on the OOF predictions.
-On this data a plain average *loses* to the best single model while a learned stack wins — because
-the stack can give a weak model a **negative** coefficient, using it as an error correction. An
-average structurally cannot do that.
-
-### 6. Seed averaging
-
-Run your best model with several seeds and rank-average. It does not make the model better; it
-reduces prediction variance for a small, reliable gain. Cheapest item on this list.
+Train a classifier to distinguish train rows from test rows. On this data it scores ~0.50 once
+missingness is imputed away, confirming no distribution drift — which is *why* CV is trustworthy
+here. Worth running on any new competition before you trust your validation at all.
 
 ### What NOT to bother with
 

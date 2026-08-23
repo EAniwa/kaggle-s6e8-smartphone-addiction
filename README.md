@@ -46,12 +46,13 @@ python build/build_notebook.py notebook/s6e8_walkthrough.ipynb
 
 ## What it covers
 
-26 sections building a strictly-measured scoreboard, from a constant baseline through six model
+29 sections building a strictly-measured scoreboard, from a constant baseline through six model
 families to a stacked ensemble. Every code cell is followed by a markdown cell explaining what
 happened and why.
 
-**Models covered:** constant baseline → logistic regression → LightGBM → XGBoost → CatBoost →
-neural network (MLP) → logistic-regression stack.
+**Models covered:** constant baseline → logistic regression → LightGBM → LightGBM + target
+encoding → XGBoost → CatBoost → neural network (MLP) → seed-averaged LightGBM →
+logistic-regression stack.
 
 The sections that matter most for a learner:
 
@@ -59,8 +60,13 @@ The sections that matter most for a learner:
   choosing the simplest setting statistically indistinguishable from the best.
 - **§22 Measuring diversity** — rank-correlates every model, showing that the three GBDTs are
   near-duplicates while the neural net is genuinely different.
-- **§23 Averaging vs stacking** — plain and rank averaging both *lose* to the best single model;
+- **§19 Feature engineering, measured** — builds generator-artifact features, then **rejects
+  them** because the gain sits inside fold noise.
+- **§20 Target encoding** — the leak-safe implementation, with the inner out-of-fold loop that
+  most tutorials omit.
+- **§25 Averaging vs stacking** — plain and rank averaging both *lose* to the best single model;
   only a learned meta-model wins.
+- **§26 Seed averaging** — measures how much of a leaderboard position is luck.
 
 - **§10 Understanding ROC AUC** — derives the metric from its definition, proves it depends only
   on ranking, and shows the score you lose by submitting hard labels instead of probabilities.
@@ -73,8 +79,8 @@ The sections that matter most for a learner:
 
 ## Runtime
 
-On the full 691,369-row dataset, expect **30–60 minutes** on Kaggle's CPU for a full run —
-six model families × 5 folds. The `num_leaves` sweep in §17 subsamples to 150,000 rows
+On the full 691,369-row dataset, expect **60–120 minutes** on Kaggle's CPU for a full run —
+eight model configurations × 5 folds, plus a capacity sweep and a 3-seed run. The `num_leaves` sweep in §17 subsamples to 150,000 rows
 automatically, since 25 refits on full data is impractical.
 
 To iterate faster while learning, sample the training frame right after loading:

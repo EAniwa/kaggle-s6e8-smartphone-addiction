@@ -167,3 +167,43 @@ detects and explains both rather than asserting something the reader cannot see:
 - **Model correlations are understated** — LightGBM ↔ XGBoost measures 0.80 on the fixture versus
   0.997 reported on full data, because small-sample fold models are unstable. §22 warns that this
   is a sample-size artefact, not evidence of complementarity.
+
+
+---
+
+# Expansion 2: feature engineering, target encoding, seed averaging (2026-08-19)
+
+Completes the remaining three of the six recommendations. Notebook now 29 sections, 88 cells.
+
+## Results on the fixture (12,000 rows)
+
+| Technique | Result | Verdict |
+|---|---|---|
+| Generator-artifact features (§19) | −0.00041 vs baseline, noise ±0.00214 | **Rejected automatically** |
+| Target encoding (§20) | 0.90652 standalone, −0.00027 vs plain LightGBM | Kept as a base model |
+| Seed averaging (§26) | +0.00071 vs average seed, +0.00044 vs best | Kept |
+| Stack with 6 base models (§25) | 0.90813, **+0.00133** vs best single | Kept — selected for submission |
+
+## The most instructive result
+
+The target-encoded model was **not** the best standalone (0.90652, third place) yet earned the
+**highest weight in the stack (+2.617)** — above plain LightGBM's +1.812. It is a different
+*representation* of the same data, so it fails differently, which is precisely what a stack
+rewards. Adding it moved the stack's edge over the best single model from +0.00079 to +0.00133.
+
+This is the clearest demonstration in the notebook that **standalone score and ensemble value are
+different quantities.**
+
+## Honest negative results retained
+
+The artifact-feature ablation rejects its own features, matching published findings that ordinary
+feature engineering on this competition runs neutral-to-negative. The notebook ships the rejection
+rather than quietly tuning until the features look good.
+
+## Fixture caveat surfaced in-code
+
+§20 prints rows-per-category before encoding. On the 12k fixture `notifications_per_day` shows
+**1.5 rows per category** — effectively unique per row, so its encoding is almost pure noise and
+smoothing pulls it back to the prior. The markdown warns that any gain reported at single-digit
+rows-per-category should be treated sceptically, and that the technique needs the full 691k rows
+to show its real value.
